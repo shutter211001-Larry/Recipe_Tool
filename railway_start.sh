@@ -74,5 +74,5 @@ $PYTHON manage.py clearsessions || true
 # ---- 6. 啟動原本的 Tandoor 容器內建啟動流程 -------------------
 # 官方映像的 entrypoint 是 /start.sh，讓它繼續接管後續流程
 # (包含 collectstatic、啟動 nginx 與 gunicorn)
-echo "🔌 移交給官方 /start.sh 啟動..."
-exec /start.sh
+echo "🔌 移交給官方 /opt/recipes/boot.sh 啟動..."
+exec /opt/recipes/boot.sh
