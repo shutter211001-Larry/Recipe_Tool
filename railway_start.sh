@@ -4,9 +4,11 @@
 #   1. 修復 usersessions_usersession.id 序列
 #   2. 執行所有 Django migrations
 #   3. 清除過期 Session
-#   4. 啟動 Gunicorn
+#   4. 啟動官方 /start.sh
 # ------------------------------------------------------------
-set -e
+
+# Django 安裝在 venv 裡，必須用這個 Python
+PYTHON=/opt/recipes/venv/bin/python
 
 echo "▶ railway_start.sh 開始執行..."
 
@@ -63,11 +65,11 @@ echo "✅ 序列修復完成"
 # ---- 4. 執行 Django migrations --------------------------------
 echo "🚀 執行 Django migrations..."
 cd /opt/recipes
-python manage.py migrate --noinput
+$PYTHON manage.py migrate --noinput
 
 # ---- 5. 清除過期 Session（解決 SuspiciousSession 警告）--------
 echo "🧹 清除過期的 Session..."
-python manage.py clearsessions || true
+$PYTHON manage.py clearsessions || true
 
 # ---- 6. 啟動原本的 Tandoor 容器內建啟動流程 -------------------
 # 官方映像的 entrypoint 是 /start.sh，讓它繼續接管後續流程
