@@ -1,112 +1,76 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # ------------------------------------------------------------
-# railway_start.sh
-#   - Runs before the actual Gunicorn server.
-#   - Fixes the missing/invalid sequence for usersessions_usersession.id
-#   - Executes all Django migrations
-#   - Starts the Gunicorn (or custom) process
+# railway_start.sh  (Alpine / sh 相容版)
+#   1. 修復 usersessions_usersession.id 序列
+#   2. 執行所有 Django migrations
+#   3. 清除過期 Session
+#   4. 啟動 Gunicorn
 # ------------------------------------------------------------
+set -e
 
-# ---- 1. 環境變數 ------------------------------------------------
-# Railway 會自動把 DATABASE_URL 注入環境變數，以下是常見的變數名稱
-#   DATABASE_URL     → 完整的 PostgreSQL 連線字串
-#   TANDOOR_PORT     → 讓內部 Nginx (若有) 監聽的埠號，預設 8080
-#   PORT (Railway)   → Railway 需要的外部埠號（與 TANDOOR_PORT 同步）
+echo "▶ railway_start.sh 開始執行..."
 
-export DATABASE_URL=${DATABASE_URL}
-export TANDOOR_PORT=${TANDOOR_PORT:-8080}
-export PORT=${PORT:-8080}
-
-# ---- 2. 取得 Postgres 連線資訊 -------------------------------
-if ! command -v python3 >/dev/null; then
-    echo "❌ Python3 not found – aborting."
+# ---- 1. 確認 DATABASE_URL 存在 --------------------------------
+if [ -z "$DATABASE_URL" ]; then
+    echo "❌ 找不到 DATABASE_URL 環境變數，請在 Railway Variables 中設定！"
     exit 1
 fi
 
-read -r DB_USER DB_PASS DB_HOST DB_PORT DB_NAME <<<$(python3 - <<'PY'
-import os, urllib.parse, sys
-url = os.getenv("DATABASE_URL")
-if not url:
-    sys.exit(1)
- p = urllib.parse.urlparse(url)
-user = urllib.parse.unquote(p.username)
-pw   = urllib.parse.unquote(p.password)
-host = p.hostname
-port = p.port
-dbname = p.path.lstrip('/')
-print(user, pw, host, port, dbname)
-PY
-)
-
-if [ -z "$DB_USER" ]; then
-    echo "❌ 無法解析 DATABASE_URL – aborting."
-    exit 1
+# ---- 2. 安裝 psql（若容器內沒有）-----------------------------
+if ! command -v psql > /dev/null 2>&1; then
+    echo "⚙️  安裝 postgresql-client..."
+    apk add --no-cache postgresql-client > /dev/null 2>&1
 fi
 
-# ---- 3. 檢查並修復 usersessions_userssession.id 序列 -------------
-if ! command -v psql >/dev/null; then
-    echo "⚙️  安裝 postgresql client ..."
-    if command -v apk >/dev/null; then
-        apk add --no-cache postgresql-client > /dev/null 2>&1
-    else
-        apt-get update -y && apt-get install -y postgresql-client
-    fi
-fi
+# ---- 3. 修復 usersessions_usersession.id 的序列 ---------------
+echo "🔧 檢查並修復 usersessions 序列..."
 
-SEQ_EXISTS=$(psql "$DATABASE_URL" -tAc "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relkind = 'S' AND relname = 'usersessions_usersession_id_seq');" 2>/dev/null)
+psql "$DATABASE_URL" <<'SQL'
+DO $$
+BEGIN
+    -- 如果序列不存在，先建立
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class WHERE relkind = 'S' AND relname = 'usersessions_usersession_id_seq'
+    ) THEN
+        CREATE SEQUENCE usersessions_usersession_id_seq
+            START WITH 1
+            INCREMENT BY 1
+            NO MINVALUE
+            NO MAXVALUE
+            CACHE 1;
+        RAISE NOTICE 'Created sequence usersessions_usersession_id_seq';
+    ELSE
+        RAISE NOTICE 'Sequence already exists, skipping create';
+    END IF;
 
-if [ "$SEQ_EXISTS" != "t" ]; then
-    echo "🔧 建立缺失的序列 usersessions_userssession_id_seq ..."
-    psql "$DATABASE_URL" <<SQL
-CREATE SEQUENCE usersessions_userssession_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-SQL
-fi
-
-# 確保 id 欄位有正確的 DEFAULT nextval(...)
-echo "🔧 為 usersessions_userssession.id 設定 default ..."
-psql "$DATABASE_URL" <<SQL
-ALTER TABLE usersessions_usersession
-    ALTER COLUMN id SET NOT NULL,
-    ALTER COLUMN id SET DEFAULT nextval('usersessions_usersession_id_seq'::regclass);
+    -- 確保 id 欄位的 DEFAULT 指向序列
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'usersessions_usersession'
+    ) THEN
+        ALTER TABLE usersessions_usersession
+            ALTER COLUMN id SET NOT NULL,
+            ALTER COLUMN id SET DEFAULT nextval('usersessions_usersession_id_seq'::regclass);
+        RAISE NOTICE 'id DEFAULT set to nextval';
+    ELSE
+        RAISE NOTICE 'Table usersessions_usersession does not exist yet, skipping ALTER';
+    END IF;
+END $$;
 SQL
 
-# 若表的型別是 bigint（BigAutoField）而序列是 integer，改成 bigint 序列
-CURRENT_TYPE=$(psql "$DATABASE_URL" -tAc "SELECT data_type FROM information_schema.columns WHERE table_name='usersessions_userssession' AND column_name='id';")
-if [[ "$CURRENT_TYPE" == "bigint" ]]; then
-    echo "🔧 將序列升級為 bigint ..."
-    psql "$DATABASE_URL" <<SQL
-ALTER SEQUENCE usersessions_userssession_id_seq AS BIGINT;
-SQL
-fi
+echo "✅ 序列修復完成"
 
-# ------------------------------------------------------------
-# 4. 讓 Django 知道使用哪個 DEFAULT_AUTO_FIELD（避免 AutoField/BigAutoField 不一致）
-export DEFAULT_AUTO_FIELD=${DEFAULT_AUTO_FIELD:-django.db.models.AutoField}
+# ---- 4. 執行 Django migrations --------------------------------
+echo "🚀 執行 Django migrations..."
+cd /opt/recipes
+python manage.py migrate --noinput
 
-# ------------------------------------------------------------
-# 5. 執行 Django migrations
-echo "🚀 執行 Django migrations ..."
-python3 manage.py migrate --noinput
+# ---- 5. 清除過期 Session（解決 SuspiciousSession 警告）--------
+echo "🧹 清除過期的 Session..."
+python manage.py clearsessions || true
 
-# ------------------------------------------------------------
-# 6. (可選) 清除所有舊的 Session，避免 SuspiciousSession 警告
-echo "🧹 清除過期的 Session ..."
-python3 manage.py clearsessions
-
-# ------------------------------------------------------------
-# 7. 啟動 Gunicorn（或你原本的啟動指令）
-# 下面假設你是使用官方的 gunicorn entrypoint：
-# gunicorn recipes.wsgi:application --bind 0.0.0.0:${PORT}
-# 若你在 docker‑compose 中使用了其他指令，請自行調整。
-
-echo "🔌 啟動 Gunicorn (Port $PORT) ..."
-exec gunicorn recipes.wsgi:application \
-    --bind 0.0.0.0:${PORT} \
-    --workers 3 \
-    --timeout 120 \
-    --log-level info
+# ---- 6. 啟動原本的 Tandoor 容器內建啟動流程 -------------------
+# 官方映像的 entrypoint 是 /start.sh，讓它繼續接管後續流程
+# (包含 collectstatic、啟動 nginx 與 gunicorn)
+echo "🔌 移交給官方 /start.sh 啟動..."
+exec /start.sh
